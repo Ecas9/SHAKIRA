@@ -1,0 +1,15 @@
+# profiles/local/config.yaml - run every rule as a local process (no scheduler).
+# For a single workstation/VM or a compute node you already hold interactively.
+#
+# Usage:  snakemake -s workflow/Snakefile --use-conda --profile profiles/local
+#    or:  SMK_PROFILE=profiles/local bash run_snakemake.sh
+#
+# Note: mem_mb/runtime carried by each rule are ignored without a scheduler; `cores` below caps
+# total local parallelism. Raise it to match the machine (the heaviest rules request ~16 threads).
+use-conda: true
+conda-frontend: conda
+cores: 8
+latency-wait: 15
+retries: 0
+rerun-incomplete: true
+printshellcmds: true

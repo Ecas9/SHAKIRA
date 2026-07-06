@@ -1,0 +1,9 @@
+# Launcher for the upstream variant-calling step (nf-core/rnavar OR nf-core/sarek).
+# Nextflow only ORCHESTRATES; the actual tools (STAR/BWA/GATK/samtools) run inside the
+# pipeline's Singularity containers. Was the `rnavar` / `env_nf` conda env + module Java/19.0.2.
+name: nextflow
+channels: [conda-forge, bioconda]
+dependencies:
+  - nextflow=24.10.4
+  - nf-core=2.14.1
+  - openjdk=17.0.10

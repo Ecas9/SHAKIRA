@@ -1,0 +1,19 @@
+# rnavar_params.yaml - reference/preset params for run_rnavar.slurm (nf-core/rnavar 1.3.0).
+# The slurm driver REWRITES this file at submit time from its EDIT block (env anchors); this
+# committed copy is the human-readable record + a standalone -params-file you can pass directly.
+# Replace the /path/to placeholders with your paths (or let run_rnavar.slurm generate it).
+input:  "/path/to/ancestry_work/table/ccle_anc_rnavar_AFR_EUR_AMR.csv"
+outdir: "/path/to/ancestry_work/rnavar"
+fasta:  "/path/to/ancestry_work/ref/FASTA/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+gtf:    "/path/to/ancestry_work/ref/GTF/Homo_sapiens.GRCh38.112.gtf"
+igenomes_ignore: true
+aligner: star
+star_twopass: true
+read_length: 101
+save_reference: true
+dbsnp:            "/path/to/gatk_bundle/dbsnp_146.hg38_rename.vcf.gz"
+dbsnp_tbi:        "/path/to/gatk_bundle/dbsnp_146.hg38_rename.vcf.gz.tbi"
+known_indels:     "/path/to/gatk_bundle/Mills_and_1000G_gold_standard_rename.indels.hg38.vcf.gz"
+known_indels_tbi: "/path/to/gatk_bundle/Mills_and_1000G_gold_standard_rename.indels.hg38.vcf.gz.tbi"
+star_max_memory_bamsort: 64424509440   # STAR --limitBAMsortRAM ~60 GiB (>48 GiB STAR needed)
+star_bins_bamsort: 100                  # STAR --outBAMsortingBinsN (more bins = less peak RAM)

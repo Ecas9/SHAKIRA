@@ -1,0 +1,49 @@
+========================================================================
+TOOL VERSIONS - RNAvar/Sarek -> ADMIXTURE ancestry pipeline
+Generated 2026-07-06 for the Snakemake/conda migration.
+Two columns matter: (1) AS-RUN = what the current scripts load on Cheaha
+(the ground truth I can read from the module/conda strings); (2) STANDARDIZED
+= the pinned conda version we migrate to (see environment.yml / envs/*.yaml).
+Run refs/capture_versions.sh on Cheaha to record the EXACT installed builds.
+========================================================================
+
+TOOL              AS-RUN ON CHEAHA (module/conda)      STANDARDIZED CONDA PIN
+----------------  -----------------------------------  ----------------------
+bcftools          module BCFtools (version unpinned)   bcftools=1.21
+samtools          (via BCFtools/htslib stack)          samtools=1.21
+htslib/tabix      (via BCFtools stack)                 htslib=1.21
+bedtools          module BEDTools (K3 scripts)         bedtools=2.31.1
+plink (v1.9)      module PLINK/1.90-foss-2016a         plink=1.90b6.21
+plink2            conda env `plink2`                   plink2=2.00a5.10
+admixture         conda env `admix` / `admix2`         admixture=1.3.0
+gnu parallel      module parallel/20240722-GCCcore-... gnu-parallel=20240722
+R                 module R/4.2.0-foss-2022b            r-base=4.2.3
+R tidyverse       (in the R module library)            r-tidyverse=2.0.0
+pandoc            conda env `pandoc`                   pandoc=3.1.11
+python            Anaconda3/2023.07-2 base (3.x)       python=3.11
+pandas            (Anaconda3 base)                     pandas=2.2.2
+gatk4             (inside nf-core containers)          gatk4=4.5.0.0  (ref prep only)
+nextflow          conda env `rnavar` / `env_nf`        nextflow=24.10.4
+nf-core tools     (with the nextflow env)              nf-core=2.14.1
+Java/JDK          module Java/19.0.2 (also 18.0.2.1)   openjdk=17.0.10
+snakemake         (new - not in the module scripts)    snakemake-minimal=8.25.5
+
+PIPELINES (pinned by -r on the nextflow command line, NOT conda):
+  nf-core/rnavar   1.3.0     (as-run; Validation/run_rnavar.slurm)
+  nf-core/sarek    3.9.0     (added option; Validation/run_sarek.slurm)
+
+SYSTEM / NOT CONDA-MANAGED:
+  Singularity      module Singularity/3.5.2-GCC-5.4.0-2.26   (container runtime; keep as a
+                   cluster module or use Apptainer. nf-core pulls its own tool containers,
+                   so STAR / BWA-MEM2 / GATK / samtools versions are fixed by the rnavar or
+                   sarek release, not by these conda envs.)
+
+NOTES
+  * AS-RUN versions marked "unpinned" cannot be read from the scripts (the module loads no
+    explicit version, e.g. `module load BCFtools`). capture_versions.sh prints the real ones.
+  * plink 1.9: the Cheaha module (foss-2016a) is an older 1.90 beta than the bioconda pin.
+    plink 1.9 output is stable across betas for the flags used here (--make-bed, --bmerge,
+    --indep-pairwise, --geno, --mind, --extract, --exclude range); if you need bit-identical
+    reproduction of an existing run, match the module build instead.
+  * r-base: module is 4.2.0; nearest reliably-available conda-forge build is 4.2.3. Analysis
+    output is not sensitive to the patch version.

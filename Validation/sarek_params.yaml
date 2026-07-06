@@ -1,0 +1,20 @@
+# sarek_params.yaml - reference/preset params for run_sarek.slurm (nf-core/sarek 3.9.0).
+# The slurm driver REWRITES this file at submit time from its EDIT block (env anchors); this
+# committed copy is the human-readable record + a standalone -params-file you can pass directly.
+# Germline per-sample HaplotypeCaller, bare-contig GRCh38 refs shared with rnavar.
+# Replace the /path/to placeholders with your paths (or let run_sarek.slurm generate it).
+input:            "/path/to/ancestry_work/table/ccle_anc_sarek_AFR_EUR_AMR.csv"
+outdir:           "/path/to/ancestry_work/sarek"
+tools:            "haplotypecaller"     # germline caller -> per-sample *.haplotypecaller.vcf.gz
+step:             "mapping"
+wes:              false                 # WGS mode; set true + pass `intervals` for exome/targeted
+aligner:          "bwa-mem2"
+igenomes_ignore:  true
+fasta:            "/path/to/ancestry_work/ref/FASTA/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+fasta_fai:        "/path/to/ancestry_work/ref/FASTA/Homo_sapiens.GRCh38.dna.primary_assembly.fa.fai"
+dbsnp:            "/path/to/gatk_bundle/dbsnp_146.hg38_rename.vcf.gz"
+dbsnp_tbi:        "/path/to/gatk_bundle/dbsnp_146.hg38_rename.vcf.gz.tbi"
+known_indels:     "/path/to/gatk_bundle/Mills_and_1000G_gold_standard_rename.indels.hg38.vcf.gz"
+known_indels_tbi: "/path/to/gatk_bundle/Mills_and_1000G_gold_standard_rename.indels.hg38.vcf.gz.tbi"
+joint_germline:   false
+save_reference:   true                  # build + keep the BWA-MEM2 index once

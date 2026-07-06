@@ -1,0 +1,5 @@
+# Supervised ADMIXTURE + CV sweep (was the `admix` / `admix2` conda envs).
+name: admixture
+channels: [conda-forge, bioconda]
+dependencies:
+  - admixture=1.3.0

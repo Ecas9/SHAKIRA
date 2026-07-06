@@ -1,0 +1,8 @@
+# Post-ADMIXTURE analysis: analyze_ancestry.R, plot_cv_error.R, K3/1k_analyze_samples.R.
+# Was module R/4.2.0-foss-2022b (+ the `pandoc` env for report rendering).
+name: r-tidyverse
+channels: [conda-forge, bioconda]
+dependencies:
+  - r-base=4.2.3
+  - r-tidyverse=2.0.0   # readr, dplyr, tidyr, stringr, ggplot2, tibble
+  - pandoc=3.1.11

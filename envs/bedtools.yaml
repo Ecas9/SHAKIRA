@@ -1,0 +1,6 @@
+# K3 high-quality-reference build (optional): exclude_admixed_1K_samples.sh / 1kGenome_filter.sh.
+# Was module BEDTools.
+name: bedtools
+channels: [conda-forge, bioconda]
+dependencies:
+  - bedtools=2.31.1

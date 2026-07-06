@@ -1,0 +1,87 @@
+# config.yaml - single source of truth for the SHAKIRA ancestry pipeline (RNA-seq/DNA -> ADMIXTURE).
+# Consumed by workflow/Snakefile; per-rule conda envs are in envs/*.yaml.
+#
+# ---------------------------------------------------------------------------------------------
+# PATHS ARE PORTABLE VIA ANCHORS. Site-specific locations are NOT hardcoded here. Instead, set
+# the three anchors under `path_anchors` below (edit them, OR export the matching env vars) and
+# every reference/input/output path is built from them. Anchor and path values may contain
+# environment variables (${VAR}) and ~, which are expanded at parse time. A run whose anchors
+# are left unset fails loudly with a message naming the anchor to set (see workflow/Snakefile).
+#
+#   anchor         env override        what it is
+#   -----------    ----------------    ------------------------------------------------------
+#   work_root      ANCESTRY_WORK       writable working area: study inputs (caller output) + all
+#                                      pipeline outputs + the caller reference (FASTA/GTF)
+#   panel_dir      ANCESTRY_PANEL      directory holding the 1000 Genomes reference panel VCF
+#   gatk_bundle    ANCESTRY_GATK       GATK known-sites bundle (upstream variant calling only)
+#
+# The values shipped below are PLACEHOLDERS. The original UAB Cheaha values are kept in comments
+# so the provenance is preserved and the original author can restore them.
+# ---------------------------------------------------------------------------------------------
+path_anchors:
+  work_root:   "/path/to/ancestry_work"      # example (Cheaha): /scratch/$USER/ancestry_validation
+  panel_dir:   "/path/to/1kg_panel"          # example (Cheaha): /data/project/<lab>/<user>/QC
+  gatk_bundle: "/path/to/gatk_bundle"        # example (Cheaha): /data/project/<lab>/references/Homo_sapiens/GATK/GRCh38/Annotation/GATKBundle
+
+reference:
+  # REQUIRED - GRCh38 1000 Genomes panel: all autosomes, bare contigs (1..22), bgzipped + indexed.
+  # Provenance: 1000G 20190312 biallelic SNV+INDEL release, per-chromosome VCFs concatenated
+  # (Lowy-Gallego et al. 2019, Wellcome Open Research 4:50). refs/prep_refs.sh HARD-FAILS if this
+  # file OR its index is missing - this is the required-1KG-panel gate.
+  kg_grch38:       "{panel_dir}/1kgenome.vcf.gz"
+  kg_grch38_index: "{panel_dir}/1kgenome.vcf.gz.tbi"   # .tbi or .csi, REQUIRED
+
+  # 1KG sample -> population panel (2-col SAMPLE_NAME<TAB>POPULATION, header). Clean 2,946-sample
+  # copy, committed under resources/ so it travels with the repo.
+  kg_panel:     "resources/1K_pops.txt"
+  lrld_regions: "resources/high-LD-regions-hg38-GRCh38.txt"   # long-range high-LD regions, excluded before LD pruning
+
+  # Upstream variant-calling reference set (rnavar/sarek); not read by the Snakemake rules directly,
+  # consumed by the nf-core runners (Validation/) and refs/prep_refs.sh.
+  fasta: "{work_root}/ref/FASTA/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+  gtf:   "{work_root}/ref/GTF/Homo_sapiens.GRCh38.112.gtf"    # rnavar/STAR only
+  dbsnp:        "{gatk_bundle}/dbsnp_146.hg38_rename.vcf.gz"
+  known_indels: "{gatk_bundle}/Mills_and_1000G_gold_standard_rename.indels.hg38.vcf.gz"
+
+  kg_exclude: ""   # OPTIONAL <98%-ancestry exclusion list (K3/run_1k_highqual_cheaha.sh). "" = full panel.
+
+# --- upstream caller: rnavar (RNA-seq; default, correct for CCLE) or sarek (DNA germline) ---
+caller: rnavar
+vcf_glob:
+  rnavar: "*.haplotypecaller.filtered.vcf.gz"
+  sarek:  "*.haplotypecaller.vcf.gz"   # confirm for your sarek release
+rnavar_dir: "{work_root}/rnavar/variant_calling/"
+sarek_dir:  "{work_root}/sarek/variant_calling/haplotypecaller/"
+
+# --- study input / output + concordance reference ---
+sample_sheet: ""   # optional 2-col TSV (sample<TAB>vcf_path); "" = auto-discover from the caller dir
+outdir:      "{work_root}/shakira_out"
+ccle_master: "Validation/ccle_ancestry_master.csv"
+
+# --- analysis parameters (locked defaults used in the SHAKIRA paper; see Methods) ---
+params:
+  k_supervised: 3
+  k_min: 1
+  k_max: 5
+  max_missing: 0.8
+  ld_window: 50
+  ld_step: 10
+  ld_r2: 0.1
+  superpops_of_interest: [AFR, EUR, AMR]
+  exclude_subpops: [ACB, ASW, MXL]
+  ref_maf: 0.05
+  study_coverage: 0.80
+  merge_maf: ""
+  merge_hwe: ""
+  merge_geno: ""
+  mind: 0.99
+
+# --- Snakemake conda-env targets ---
+envs:
+  bcftools:  envs/bcftools.yaml
+  plink:     envs/plink.yaml
+  admixture: envs/admixture.yaml
+  r:         envs/r-tidyverse.yaml
+  python:    envs/python.yaml
+  gatk:      envs/gatk.yaml
+  nextflow:  envs/nextflow.yaml

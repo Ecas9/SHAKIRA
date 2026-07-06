@@ -1,0 +1,7 @@
+# PLINK stack: beds, var-ids (plink2), merge + variant QC + LD-prune + mind.
+# plink = v1.9 (was module PLINK/1.90-foss-2016a); plink2 = the former `plink2` conda env.
+name: plink
+channels: [conda-forge, bioconda]
+dependencies:
+  - plink=1.90b6.21
+  - plink2=2.00a5.10

@@ -1,0 +1,35 @@
+# profiles/slurm/config.yaml - Snakemake 8 SLURM execution profile.
+# Uses snakemake-executor-plugin-slurm (in environment.yml). Each rule becomes a Slurm job;
+# per-rule threads -> --cpus-per-task, resources.mem_mb -> --mem, resources.runtime -> --time (min),
+# resources.slurm_partition -> --partition, resources.slurm_account -> --account.
+#
+# THIS FILE IS THE ONE PLACE TO ADAPT THE PIPELINE TO YOUR CLUSTER. The Snakefile carries no
+# site-specific scheduler settings (no hardcoded partitions/accounts); set them here.
+#
+# Usage (from repo root, on a login/submit node):  snakemake -s workflow/Snakefile --profile profiles/slurm
+executor: slurm
+use-conda: true
+conda-frontend: conda
+jobs: 30                       # max concurrent Slurm jobs
+latency-wait: 60               # shared/networked FS: wait this long for outputs to appear
+retries: 1                     # retry a failed job once (transient node/OOM)
+rerun-incomplete: true
+printshellcmds: true
+
+# Portable defaults: memory + walltime only. By default NO --partition/--account is sent, so the
+# job lands on your cluster's default partition. Set them below if your site requires it.
+default-resources:
+  runtime: 120                 # minutes
+  mem_mb: 8000
+  # slurm_partition: "<your_default_partition>"   # e.g. Cheaha: "short" (<=12 h)
+  # slurm_account:   "<your_slurm_account>"       # e.g. Cheaha: "<lab>-lab"; omit if not required
+
+# OPTIONAL per-rule overrides. Uncomment to route the three short (<30 min) rules to a fast/express
+# queue if your cluster has one. On UAB Cheaha these used the "express" partition (<=2 h).
+# set-resources:
+#   make_pop:
+#     slurm_partition: "express"
+#   analyze:
+#     slurm_partition: "express"
+#   plot_cv:
+#     slurm_partition: "express"

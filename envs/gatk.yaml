@@ -1,0 +1,7 @@
+# Reference prep only: CreateSequenceDictionary for the FASTA (refs/prep_refs.sh).
+# The rnavar/sarek variant calling runs GATK inside its own nf-core Singularity containers,
+# NOT from this env.
+name: gatk
+channels: [conda-forge, bioconda]
+dependencies:
+  - gatk4=4.5.0.0

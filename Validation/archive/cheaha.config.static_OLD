@@ -1,0 +1,36 @@
+// cheaha.config  --  nf-core/rnavar on UAB Cheaha (Slurm + Singularity), tuned for speed
+// Pass with: -c cheaha.config   (no pipeline --params here)
+
+process {
+    executor = 'slurm'
+    queue    = 'short'              // 12 h cap; per-sample RNA STAR + scattered GATK fit easily
+
+    withLabel:process_low    { cpus = 2;  memory = 12.GB; time = 6.h  }
+    withLabel:process_medium { cpus = 8;  memory = 42.GB; time = 12.h }
+    withLabel:process_high   { cpus = 16; memory = 64.GB; time = 12.h }
+
+    // STAR is the per-sample bottleneck: throw cores at it (RNA-seq finishes well under 12 h)
+    withName:'.*STAR_ALIGN.*'          { cpus = 20; memory = 64.GB; time = 12.h }
+    withName:'.*STAR_GENOMEGENERATE.*' { cpus = 16; memory = 72.GB; time = 12.h }   // runs once here (your 2.7.1a index is rebuilt); --save_reference keeps it
+    // SplitNCigarReads + HaplotypeCaller are already scattered over GTF interval chunks;
+    // keep each chunk modest so MANY run in parallel across the cluster.
+    withName:'.*SPLITNCIGAR.*'         { cpus = 2; memory = 18.GB; time = 8.h }
+    withName:'.*HAPLOTYPECALLER.*'     { cpus = 2; memory = 18.GB; time = 8.h }
+    withName:'.*BASERECALIBRATOR.*'    { cpus = 2; memory = 16.GB; time = 6.h }
+    withName:'.*APPLYBQSR.*'           { cpus = 2; memory = 16.GB; time = 6.h }
+}
+
+executor {
+    queueSize       = 200            // let the scheduler pack many scattered jobs at once
+    submitRateLimit = '30/1min'
+}
+
+singularity {
+    enabled    = true
+    autoMounts = true
+}
+// export NXF_SINGULARITY_CACHEDIR=$SCRATCH/.singularity_cache   (set in the wrapper)
+//
+// If a STAR job ever times out on 'short', bump just that label to queue 'medium'
+// (50 h). Throughput here comes from queueSize + scatter, not from longer walltimes.
+

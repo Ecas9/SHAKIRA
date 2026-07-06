@@ -1,0 +1,27 @@
+# Snakemake / pipeline runtime
+.snakemake/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Pipeline outputs / working dirs (results live under the configured work_root, but ignore
+# these names in case anyone points outputs at the repo)
+results/
+shakira_out/
+work/
+slurm_logs/
+
+# Nextflow (upstream variant calling)
+.nextflow/
+.nextflow.log*
+
+# OS / editor / sandbox artifacts
+.DS_Store
+Thumbs.db
+.fuse_hidden*
+*.__tmp
+_sentinel*
+_probe*
+err

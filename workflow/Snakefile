@@ -1,0 +1,389 @@
+# =============================================================================
+# SHAKIRA - Superpopulation-level Haplotype Ancestry from K-population Inference of RNA Assays.
+# Snakemake workflow: per-sample RNA-seq (or DNA) variant calls -> supervised ADMIXTURE ancestry
+# -> concordance report. Each rule is one pipeline step; the per-sample ingest step fans out into
+# one job per sample. Analysis params + reference paths come from config.yaml; per-rule tools
+# from envs/*.yaml.
+#
+# Run from the REPO ROOT:
+#   snakemake -s workflow/Snakefile --use-conda --profile profiles/slurm
+#   snakemake -s workflow/Snakefile -n            # dry run (DAG preview)
+# =============================================================================
+import os, glob
+
+try:
+    from snakemake.exceptions import WorkflowError
+except Exception:                      # older/newer snakemake internals
+    WorkflowError = RuntimeError
+
+configfile: "config.yaml"
+
+WORKFLOW_DIR = os.path.dirname(os.path.abspath(workflow.snakefile))
+REPO_ROOT    = os.path.dirname(WORKFLOW_DIR)
+SCRIPTS      = os.path.join(WORKFLOW_DIR, "scripts")   # pipeline helper scripts
+
+# --- portable path resolution ---------------------------------------------------------------
+# Paths come from config.yaml and are built from the anchors in `path_anchors`. Each anchor may
+# be overridden by an environment variable (see _ANCHOR_ENV). Anchor and path values are expanded
+# for ${ENV_VARS} and ~, then {anchor} tokens are substituted. Relative paths resolve against the
+# repo root. Paths that still look like the shipped "/path/to" placeholder (or an unexpanded
+# ${VAR}) are reported loudly so a run never silently uses the wrong location.
+_ANCHOR_ENV = {"work_root": "ANCESTRY_WORK", "panel_dir": "ANCESTRY_PANEL", "gatk_bundle": "ANCESTRY_GATK"}
+
+def _expand(v):
+    return os.path.expanduser(os.path.expandvars(str(v))) if v is not None else v
+
+ANCHORS = {k: _expand(os.environ.get(_ANCHOR_ENV.get(k, ""), "") or v)
+           for k, v in (config.get("path_anchors") or {}).items()}
+
+def rp(p):
+    """Resolve a config path: substitute {anchor} tokens, expand ${env}/~, make absolute."""
+    if not p:
+        return p
+    p = str(p)
+    if "{" in p:
+        try:
+            p = p.format(**ANCHORS)
+        except KeyError as e:
+            raise WorkflowError(
+                "config path %r references unknown anchor %s; define it under "
+                "path_anchors in config.yaml" % (p, e))
+    p = _expand(p)
+    return p if os.path.isabs(p) else os.path.join(REPO_ROOT, p)
+
+def rp_required(p, what):
+    """rp() plus a guard: fail if the result still looks like an unconfigured placeholder."""
+    r = rp(p)
+    if r and (("/path/to" in r) or ("${" in r)):
+        raise WorkflowError(
+            "%s resolves to an unconfigured path:\n    %s\n"
+            "Set the anchors under path_anchors in config.yaml, or export "
+            "ANCESTRY_WORK / ANCESTRY_PANEL / ANCESTRY_GATK. See the top-level README." % (what, r))
+    return r
+
+OUTDIR    = rp_required(config["outdir"], "outdir").rstrip("/")
+P         = config["params"]
+AUTOSOMES = ",".join(str(i) for i in range(1, 23))
+MISS_THR  = "%.6f" % (1.0 - float(P["max_missing"]))
+
+CALLER     = config["caller"]
+VCF_GLOB   = config["vcf_glob"][CALLER]
+CALLER_DIR = rp_required(config["rnavar_dir"] if CALLER == "rnavar" else config["sarek_dir"],
+                         "%s_dir" % CALLER)
+
+KG_GRCH38 = rp_required(config["reference"]["kg_grch38"], "reference.kg_grch38")
+KG_PANEL  = rp(config["reference"]["kg_panel"])
+LRLD      = rp(config["reference"].get("lrld_regions", "") or "")
+KG_EXCL   = rp(config["reference"].get("kg_exclude", "") or "")
+CCLE      = rp(config["ccle_master"])
+
+K_SUP  = int(P["k_supervised"]); K_MIN = int(P["k_min"]); K_MAX = int(P["k_max"])
+SOI    = " ".join(P["superpops_of_interest"])
+EXSUB  = " ".join(P.get("exclude_subpops", []))
+REF_MAF    = "" if P.get("ref_maf", "")    in (None, "") else str(P["ref_maf"])
+STUDY_COV  = "" if P.get("study_coverage", "") in (None, "") else str(P["study_coverage"])
+MERGE_MAF  = "" if P.get("merge_maf", "")  in (None, "") else str(P["merge_maf"])
+MERGE_HWE  = "" if P.get("merge_hwe", "")  in (None, "") else str(P["merge_hwe"])
+MERGE_GENO = "" if P.get("merge_geno", "") in (None, "") else str(P["merge_geno"])
+MIND   = str(P["mind"])
+E = {k: rp(v) for k, v in config["envs"].items()}
+
+def load_samples():
+    sheet = config.get("sample_sheet", "")
+    s = {}
+    if sheet and os.path.exists(rp(sheet)):
+        for ln in open(rp(sheet)):
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or ln.lower().startswith("sample\t"):
+                continue
+            parts = ln.split("\t")
+            if len(parts) >= 2:
+                s[parts[0]] = parts[1]
+    else:
+        suffix = VCF_GLOB.lstrip("*")
+        for p in sorted(glob.glob(os.path.join(CALLER_DIR, "**", VCF_GLOB), recursive=True)):
+            b = os.path.basename(p)
+            name = b[:-len(suffix)] if suffix and b.endswith(suffix) else os.path.splitext(b)[0]
+            s[name] = p
+    return s
+
+SAMPLES = load_samples()
+print("[snakemake] caller=%s  samples=%d  outdir=%s" % (CALLER, len(SAMPLES), OUTDIR))
+
+wildcard_constraints:
+    K = r"[0-9]+",
+    sample = r"[^/]+"
+
+rule all:
+    input:
+        f"{OUTDIR}/admixture/prunedData.{K_SUP}.Q",
+        f"{OUTDIR}/analysis/concordance_summary.txt",
+        f"{OUTDIR}/analysis/plot_cv_error.pdf",
+
+rule ingest:
+    input:  lambda wc: SAMPLES[wc.sample]
+    output: vcf=f"{OUTDIR}/normalized/{{sample}}.norm.snps.vcf.gz",
+            tbi=f"{OUTDIR}/normalized/{{sample}}.norm.snps.vcf.gz.tbi"
+    threads: 2
+    resources: mem_mb=8000, runtime=120
+    conda: E["bcftools"]
+    shell:
+        r"""
+        AUTOSOMES="{AUTOSOMES}" OUTDIR="{OUTDIR}" INGEST_THREADS={threads} \
+            bash {SCRIPTS}/ingest_one.sh {wildcards.sample} {input} >/dev/null
+        """
+
+rule cohort_merge:
+    input:  expand(f"{OUTDIR}/normalized/{{s}}.norm.snps.vcf.gz", s=sorted(SAMPLES))
+    output: vcf=f"{OUTDIR}/cohort/merge.vcf.gz",
+            tbi=f"{OUTDIR}/cohort/merge.vcf.gz.tbi",
+            mlist=f"{OUTDIR}/cohort/merge.list"
+    threads: 8
+    resources: mem_mb=32000, runtime=360
+    conda: E["bcftools"]
+    shell:
+        r"""
+        : > {output.mlist}
+        for f in {input}; do echo "$f" >> {output.mlist}; done
+        if [ "$(wc -l < {output.mlist})" -le 1 ]; then
+            bcftools view --threads {threads} -Oz -o {output.vcf} "$(cat {output.mlist})"
+        else
+            bcftools merge -m none -l {output.mlist} --threads {threads} -Ou \
+              | bcftools norm -m -any --threads {threads} -Ou \
+              | bcftools view -m2 -M2 -v snps --threads {threads} -Oz -o {output.vcf}
+        fi
+        bcftools index -t --threads {threads} {output.vcf}
+        """
+
+rule study_qc:
+    input:  f"{OUTDIR}/cohort/merge.vcf.gz"
+    output: vcf=f"{OUTDIR}/study/study_all_chroms.vcf.gz",
+            tbi=f"{OUTDIR}/study/study_all_chroms.vcf.gz.tbi",
+            snps=f"{OUTDIR}/study/study_snps_final.txt"
+    threads: 4
+    resources: mem_mb=16000, runtime=240
+    conda: E["bcftools"]
+    shell:
+        r"""
+        bcftools view -i "F_MISSING <= {MISS_THR}" -m2 -M2 -v snps -U \
+            --threads {threads} -Oz -o {output.vcf} {input}
+        bcftools index -t --threads {threads} {output.vcf}
+        bcftools query -f '%CHROM\t%POS\n' {output.vcf} > {output.snps}
+        """
+
+rule ref_prep:
+    input:  panel=KG_PANEL
+    output: keep=f"{OUTDIR}/ref/ref_keep_samples.txt",
+            maf=f"{OUTDIR}/ref/maf_pass.positions"
+    threads: 8
+    resources: mem_mb=24000, runtime=360
+    conda: E["bcftools"]
+    params: kg=KG_GRCH38, kgexcl=KG_EXCL
+    shell:
+        r"""
+        SUPERPOPS_OF_INTEREST="{SOI}" EXCLUDE_SUBPOPS="{EXSUB}" REF_MAF="{REF_MAF}" \
+        KG_EXCLUDE="{params.kgexcl}" NPROC={threads} \
+            bash {SCRIPTS}/ref_maf_per_superpop.sh {params.kg} {input.panel} \
+                 {output.keep} {output.maf} {OUTDIR}/ref/maf_work
+        touch {output.maf}
+        """
+
+rule ref_harmonize:
+    input:  snps=f"{OUTDIR}/study/study_snps_final.txt",
+            maf=f"{OUTDIR}/ref/maf_pass.positions",
+            keep=f"{OUTDIR}/ref/ref_keep_samples.txt"
+    output: vcf=f"{OUTDIR}/ref/study_in_1kg_all_chroms.vcf.gz",
+            tbi=f"{OUTDIR}/ref/study_in_1kg_all_chroms.vcf.gz.tbi"
+    threads: 8
+    resources: mem_mb=24000, runtime=360
+    conda: E["bcftools"]
+    params: kg=KG_GRCH38
+    shell:
+        r"""
+        [ -f "{params.kg}.tbi" ] || [ -f "{params.kg}.csi" ] || {{ echo "[ERROR] no index for {params.kg}"; exit 1; }}
+        SNPS_USE="{input.snps}"
+        if [ -s "{input.maf}" ]; then
+            SNPS_USE="{OUTDIR}/ref/study_snps_maf_pass.txt"
+            awk 'NR==FNR{{a[$1"\t"$2]=1; next}} (($1"\t"$2) in a)' {input.maf} {input.snps} > "$SNPS_USE"
+            [ -s "$SNPS_USE" ] || {{ echo "[ERROR] no study SNPs passed per-superpop MAF"; exit 1; }}
+        fi
+        bcftools view -R "$SNPS_USE" -S {input.keep} --force-samples --threads {threads} -Ou "{params.kg}" \
+          | bcftools norm -m -any --threads {threads} -Ou \
+          | bcftools view -m2 -M2 -v snps --threads {threads} -Oz -o {output.vcf}
+        bcftools index -t --threads {threads} {output.vcf}
+        """
+
+rule bed_study:
+    input:  f"{OUTDIR}/study/study_all_chroms.vcf.gz"
+    output: multiext(f"{OUTDIR}/bed/study", ".bed", ".bim", ".fam")
+    threads: 4
+    resources: mem_mb=16000, runtime=120
+    conda: E["plink"]
+    shell:
+        r"""
+        plink --vcf {input} --double-id --vcf-half-call m --keep-allele-order --allow-no-sex \
+              --make-bed --out {OUTDIR}/bed/study --threads {threads}
+        """
+
+rule bed_ref:
+    input:  f"{OUTDIR}/ref/study_in_1kg_all_chroms.vcf.gz"
+    output: multiext(f"{OUTDIR}/bed/ref", ".bed", ".bim", ".fam")
+    threads: 4
+    resources: mem_mb=16000, runtime=120
+    conda: E["plink"]
+    shell:
+        r"""
+        plink --vcf {input} --double-id --vcf-half-call m --keep-allele-order --allow-no-sex \
+              --make-bed --out {OUTDIR}/bed/ref --threads {threads}
+        """
+
+rule varids:
+    input:  multiext(f"{OUTDIR}/bed/{{ds}}", ".bed", ".bim", ".fam")
+    output: multiext(f"{OUTDIR}/bed/{{ds}}.varids", ".bed", ".bim", ".fam")
+    wildcard_constraints: ds="study|ref"
+    threads: 4
+    resources: mem_mb=16000, runtime=120
+    conda: E["plink"]
+    shell:
+        r"""
+        plink2 --bfile {OUTDIR}/bed/{wildcards.ds} --set-all-var-ids '@_#_$r_$a' \
+               --new-id-max-allele-len 100 --make-bed --out {OUTDIR}/bed/{wildcards.ds}.varids --threads {threads}
+        """
+
+rule merge_intersect:
+    input:  study=multiext(f"{OUTDIR}/bed/study.varids", ".bed", ".bim", ".fam"),
+            ref=multiext(f"{OUTDIR}/bed/ref.varids", ".bed", ".bim", ".fam")
+    output: multiext(f"{OUTDIR}/merge/1kg_study_merge_qced", ".bed", ".bim", ".fam")
+    threads: 8
+    resources: mem_mb=32000, runtime=240
+    conda: E["plink"]
+    shell:
+        r"""
+        plink --bfile {OUTDIR}/bed/study.varids --bmerge {OUTDIR}/bed/ref.varids \
+              --keep-allele-order --allow-no-sex --make-bed --out {OUTDIR}/merge/1kg_study_merge --threads {threads}
+        cut -f2 {OUTDIR}/bed/study.varids.bim | sort -u > {OUTDIR}/merge/ids_study.txt
+        cut -f2 {OUTDIR}/bed/ref.varids.bim   | sort -u > {OUTDIR}/merge/ids_ref.txt
+        comm -12 {OUTDIR}/merge/ids_study.txt {OUTDIR}/merge/ids_ref.txt > {OUTDIR}/merge/overlap_snps.txt
+        [ -s {OUTDIR}/merge/overlap_snps.txt ] || {{ echo "[ERROR] study/1KG SNP intersection empty"; exit 1; }}
+        plink --bfile {OUTDIR}/merge/1kg_study_merge --extract {OUTDIR}/merge/overlap_snps.txt \
+              --keep-allele-order --allow-no-sex --make-bed --out {OUTDIR}/merge/1kg_study_merge_qced --threads {threads}
+        """
+
+rule variant_qc:
+    input:  qced=multiext(f"{OUTDIR}/merge/1kg_study_merge_qced", ".bed", ".bim", ".fam"),
+            studyfam=f"{OUTDIR}/bed/study.varids.fam"
+    output: multiext(f"{OUTDIR}/merge/1kg_study_merge_vqc", ".bed", ".bim", ".fam")
+    threads: 8
+    resources: mem_mb=32000, runtime=240
+    conda: E["plink"]
+    params: lrld=LRLD
+    shell:
+        r"""
+        QCIN={OUTDIR}/merge/1kg_study_merge_qced
+        VQC_FLAGS=""
+        GENO_THR="{MERGE_GENO}"
+        if [ -z "$GENO_THR" ] && [ -n "{STUDY_COV}" ]; then
+            n_study=$(wc -l < {input.studyfam}); n_total=$(wc -l < $QCIN.fam)
+            GENO_THR=$(awk -v ne="$n_study" -v nt="$n_total" -v p="{STUDY_COV}" 'BEGIN{{ if (nt>0) printf "%.10f", (1-p)*ne/nt }}')
+        fi
+        [ -n "$GENO_THR" ]    && VQC_FLAGS="$VQC_FLAGS --geno $GENO_THR"
+        [ -n "{MERGE_MAF}" ]  && VQC_FLAGS="$VQC_FLAGS --maf {MERGE_MAF}"
+        [ -n "{MERGE_HWE}" ]  && VQC_FLAGS="$VQC_FLAGS --hwe {MERGE_HWE}"
+        if [ -n "{params.lrld}" ]; then
+            awk '{{ sub(/^chr/,"",$1); print }}' {params.lrld} > {OUTDIR}/merge/lrld_regions.bare.txt
+            VQC_FLAGS="$VQC_FLAGS --exclude range {OUTDIR}/merge/lrld_regions.bare.txt"
+        fi
+        echo "[INFO] variant-QC flags:$VQC_FLAGS"
+        plink --bfile $QCIN $VQC_FLAGS --keep-allele-order --allow-no-sex \
+              --make-bed --out {OUTDIR}/merge/1kg_study_merge_vqc --threads {threads}
+        """
+
+rule ld_prune:
+    input:  multiext(f"{OUTDIR}/merge/1kg_study_merge_vqc", ".bed", ".bim", ".fam")
+    output: multiext(f"{OUTDIR}/pruned/prunedData_all", ".bed", ".bim", ".fam")
+    threads: 8
+    resources: mem_mb=32000, runtime=240
+    conda: E["plink"]
+    shell:
+        r"""
+        plink --bfile {OUTDIR}/merge/1kg_study_merge_vqc --indep-pairwise {P[ld_window]} {P[ld_step]} {P[ld_r2]} \
+              --allow-no-sex --out {OUTDIR}/pruned/indep --threads {threads}
+        plink --bfile {OUTDIR}/merge/1kg_study_merge_vqc --extract {OUTDIR}/pruned/indep.prune.in \
+              --keep-allele-order --allow-no-sex --make-bed --out {OUTDIR}/pruned/prunedData_all --threads {threads}
+        """
+
+rule mind_drop:
+    input:  multiext(f"{OUTDIR}/pruned/prunedData_all", ".bed", ".bim", ".fam")
+    output: multiext(f"{OUTDIR}/pruned/prunedData", ".bed", ".bim", ".fam")
+    threads: 4
+    resources: mem_mb=16000, runtime=120
+    conda: E["plink"]
+    shell:
+        r"""
+        plink --bfile {OUTDIR}/pruned/prunedData_all --mind {MIND} \
+              --keep-allele-order --allow-no-sex --make-bed --out {OUTDIR}/pruned/prunedData --threads {threads}
+        """
+
+rule make_pop:
+    input:  fam=f"{OUTDIR}/pruned/prunedData.fam", panel=KG_PANEL
+    output: f"{OUTDIR}/pruned/prunedData.pop"
+    resources: mem_mb=4000, runtime=30
+    conda: E["python"]
+    shell:
+        r"""
+        python3 {SCRIPTS}/pop.py --fam {input.fam} --sample-pop {input.panel} --out {output}
+        nfam=$(wc -l < {input.fam}); npop=$(wc -l < {output})
+        [ "$nfam" -eq "$npop" ] || {{ echo "[ERROR] .pop ($npop) != .fam ($nfam)"; exit 1; }}
+        [ "$(grep -c . {output} || true)" -gt 0 ] || {{ echo "[ERROR] .pop all blank"; exit 1; }}
+        """
+
+rule admixture_supervised:
+    input:  bed=multiext(f"{OUTDIR}/pruned/prunedData", ".bed", ".bim", ".fam"),
+            popf=f"{OUTDIR}/pruned/prunedData.pop"
+    output: q=f"{OUTDIR}/admixture/prunedData.{K_SUP}.Q",
+            p=f"{OUTDIR}/admixture/prunedData.{K_SUP}.P"
+    threads: 16
+    resources: mem_mb=64000, runtime=720
+    conda: E["admixture"]
+    shell:
+        r"""
+        mkdir -p {OUTDIR}/admixture
+        ( cd {OUTDIR}/admixture && admixture --supervised {OUTDIR}/pruned/prunedData.bed {K_SUP} -j{threads} )
+        """
+
+rule admixture_cv:
+    input:  bed=multiext(f"{OUTDIR}/pruned/prunedData", ".bed", ".bim", ".fam"),
+            popf=f"{OUTDIR}/pruned/prunedData.pop"
+    output: log=f"{OUTDIR}/admixture/cv/log.{{K}}.out"
+    threads: 16
+    resources: mem_mb=64000, runtime=720
+    conda: E["admixture"]
+    shell:
+        r"""
+        mkdir -p {OUTDIR}/admixture/cv
+        ( cd {OUTDIR}/admixture/cv && admixture --cv {OUTDIR}/pruned/prunedData.bed {wildcards.K} -j{threads} | tee log.{wildcards.K}.out )
+        """
+
+rule analyze:
+    input:  q=f"{OUTDIR}/admixture/prunedData.{K_SUP}.Q",
+            fam=f"{OUTDIR}/pruned/prunedData.fam",
+            popf=f"{OUTDIR}/pruned/prunedData.pop",
+            ref=CCLE
+    output: summary=f"{OUTDIR}/analysis/concordance_summary.txt",
+            props=f"{OUTDIR}/analysis/ancestry_study_proportions.csv"
+    resources: mem_mb=16000, runtime=30
+    conda: E["r"]
+    shell:
+        r"""
+        Rscript {SCRIPTS}/analyze_ancestry.R {OUTDIR} {input.ref} {OUTDIR}/analysis {K_SUP}
+        """
+
+rule plot_cv:
+    input:  expand(f"{OUTDIR}/admixture/cv/log.{{K}}.out", K=range(K_MIN, K_MAX + 1))
+    output: f"{OUTDIR}/analysis/plot_cv_error.pdf"
+    resources: mem_mb=8000, runtime=20
+    conda: E["r"]
+    shell:
+        r"""
+        Rscript {SCRIPTS}/plot_cv_error.R {OUTDIR} {OUTDIR}/analysis
+        """

@@ -1,0 +1,7 @@
+# Sample-sheet builder (Validation/map_srr_to_ancestry.py). pop.py is stdlib-only and can
+# run in any of these envs. python3 was previously provided by Anaconda3 base.
+name: python
+channels: [conda-forge, bioconda]
+dependencies:
+  - python=3.11
+  - pandas=2.2.2

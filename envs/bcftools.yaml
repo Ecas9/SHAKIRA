@@ -1,0 +1,8 @@
+# Variant wrangling: ingest, cohort merge, missingness QC, panel harmonize,
+# per-superpop MAF (ref_maf_per_superpop.sh). Also covers reference prep (bgzip/tabix).
+name: bcftools
+channels: [conda-forge, bioconda]
+dependencies:
+  - bcftools=1.21
+  - samtools=1.21
+  - htslib=1.21        # tabix, bgzip
