@@ -45,6 +45,12 @@ reference:
 
   kg_exclude: ""   # OPTIONAL <98%-ancestry exclusion list (K3/run_1k_highqual_cheaha.sh). "" = full panel.
 
+  # Contig naming used by kg_grch38 above: "nochr" (1,2,...,22) or "chr" (chr1,chr2,...).
+  # The study VCFs do NOT have to match: workflow/scripts/ingest_one.sh detects each study
+  # VCF's own naming and converts it to this one. Set it to whatever the PANEL uses -
+  # a mismatch here is the classic cause of an empty study/1KG SNP intersection.
+  contig_style: "nochr"
+
 # --- upstream caller: rnavar (RNA-seq; default, correct for CCLE) or sarek (DNA germline) ---
 caller: rnavar
 vcf_glob:
@@ -75,6 +81,40 @@ params:
   merge_hwe: ""
   merge_geno: ""
   mind: 0.99
+
+  # bcftools --apply-filters list applied to each study VCF at ingest. "PASS,." keeps
+  # records marked PASS and records whose FILTER column is unset ("."), which is what GATK
+  # HaplotypeCaller writes when no VariantFiltration/CNNScoreVariants step was run - a
+  # bare "PASS" silently yields zero variants for those inputs. Use "PASS" to require an
+  # explicit PASS, or e.g. "PASS,.,LowQual" to be more permissive.
+  ingest_filters: "PASS,."
+
+  # --- strand-ambiguous SNPs ---------------------------
+  # Drop palindromic A/T and C/G SNPs from the study/1KG intersection. SHAKIRA matches
+  # variants on exact CHROM_POS_REF_ALT against a GRCh38-called reference and never
+  # attempts a strand or A1/A2 flip, so these SNPs are not actually at risk here; the
+  # filter is on by default because it removes the whole class of risk for free.
+  # Set to false to reproduce the pre-revision marker set.
+  exclude_ambiguous: true
+
+  # --- sample-level input QC gate ----------------------
+  # Applied to each per-sample VCF after ingest and BEFORE the cohort merge, so a library
+  # that cannot support an ancestry call is excluded up front with a recorded reason
+  # (qc/sample_qc.tsv) rather than silently producing a low-confidence ancestry vector.
+  qc:
+    min_snps:      10000        # retained PASS biallelic autosomal SNPs
+    min_median_dp: 0            # DISABLED by default. FORMAT/DP at called RNA-seq SNPs
+                                # tracks transcript abundance, so the per-sample MEDIAN is
+                                # 2-4 even for good libraries (observed across 53 panNET
+                                # RNA-seq samples: no library reached 5). The value is still
+                                # reported per sample in qc/sample_qc.tsv. Raise it (e.g. 10)
+                                # for WES/WGS input, where median DP IS a quality measure.
+    het_range:     [0.05, 0.70] # heterozygous fraction; outside = contamination / LOH.
+                                # Upper bound is 0.70 rather than 0.60 for RNA-seq: low-depth
+                                # het over-calling and allele-specific expression push good
+                                # libraries to ~0.6 (observed range here 0.154-0.609).
+    min_ts_tv:     1.50         # transition/transversion ratio; 0 disables
+    max_fail_frac: 0.50        # abort the run if more than this fraction fail
 
 # --- Snakemake conda-env targets ---
 envs:

@@ -86,6 +86,26 @@ MERGE_MAF  = "" if P.get("merge_maf", "")  in (None, "") else str(P["merge_maf"]
 MERGE_HWE  = "" if P.get("merge_hwe", "")  in (None, "") else str(P["merge_hwe"])
 MERGE_GENO = "" if P.get("merge_geno", "") in (None, "") else str(P["merge_geno"])
 MIND   = str(P["mind"])
+
+# --- sample-level input QC gate (params.qc) + strand-ambiguous SNP handling -------------
+QC          = P.get("qc", {}) or {}
+QC_MIN_SNPS = int(QC.get("min_snps", 10000))
+QC_MIN_DP   = float(QC.get("min_median_dp", 5))
+QC_HET      = list(QC.get("het_range", [0.05, 0.60]))
+QC_TSTV     = float(QC.get("min_ts_tv", 1.50))
+QC_MAXFAIL  = float(QC.get("max_fail_frac", 0.50))
+EXCL_AMBIG  = bool(P.get("exclude_ambiguous", True))
+
+# --- study/reference contig-naming harmonisation + FILTER policy (revision) -------------
+# The study VCFs and the 1000G panel must agree on contig naming before anything is
+# intersected. ingest_one.sh detects each study VCF's own style and converts it to the
+# panel's, declared here. INGEST_FILTERS is the bcftools --apply-filters list: the default
+# "PASS,." keeps records marked PASS *and* records whose FILTER column is unset, which is
+# what GATK writes when no hard-filtering step was run; "PASS" requires an explicit PASS.
+REF_STYLE   = str(config["reference"].get("contig_style", "nochr")).lower()
+ING_FILTERS = str(P.get("ingest_filters", "PASS,."))
+if REF_STYLE not in ("chr", "nochr"):
+    raise WorkflowError("reference.contig_style must be 'chr' or 'nochr', got %r" % REF_STYLE)
 E = {k: rp(v) for k, v in config["envs"].items()}
 
 def load_samples():
@@ -116,6 +136,7 @@ wildcard_constraints:
 
 rule all:
     input:
+        f"{OUTDIR}/qc/sample_qc.tsv",
         f"{OUTDIR}/admixture/prunedData.{K_SUP}.Q",
         f"{OUTDIR}/analysis/concordance_summary.txt",
         f"{OUTDIR}/analysis/plot_cv_error.pdf",
@@ -123,18 +144,55 @@ rule all:
 rule ingest:
     input:  lambda wc: SAMPLES[wc.sample]
     output: vcf=f"{OUTDIR}/normalized/{{sample}}.norm.snps.vcf.gz",
-            tbi=f"{OUTDIR}/normalized/{{sample}}.norm.snps.vcf.gz.tbi"
+            tbi=f"{OUTDIR}/normalized/{{sample}}.norm.snps.vcf.gz.tbi",
+            qc=f"{OUTDIR}/qc/{{sample}}.metrics.tsv"
     threads: 2
     resources: mem_mb=8000, runtime=120
     conda: E["bcftools"]
     shell:
         r"""
         AUTOSOMES="{AUTOSOMES}" OUTDIR="{OUTDIR}" INGEST_THREADS={threads} \
+        REF_CONTIG_STYLE="{REF_STYLE}" INGEST_FILTERS="{ING_FILTERS}" \
             bash {SCRIPTS}/ingest_one.sh {wildcards.sample} {input} >/dev/null
+        bash {SCRIPTS}/sample_qc_one.sh {wildcards.sample} {output.vcf} {output.qc}
+        """
+
+rule samples_table:
+    """Materialise the resolved sample -> caller-VCF map so the QC gate (and the
+    reader of a finished run) can see exactly which input each sample came from."""
+    output: f"{OUTDIR}/cohort/samples.resolved"
+    resources: mem_mb=2000, runtime=10
+    run:
+        import os
+        os.makedirs(os.path.dirname(output[0]), exist_ok=True)
+        with open(output[0], "w") as fh:
+            for k in sorted(SAMPLES):
+                fh.write("%s\t%s\n" % (k, SAMPLES[k]))
+
+rule sample_qc:
+    """INPUT QC GATE. Drops samples that cannot support an ancestry
+    call - too few callable SNPs, or coverage/quality too low - BEFORE they reach the
+    cohort merge, and records the reason for every exclusion in qc/sample_qc.tsv."""
+    input:  metrics=expand(f"{OUTDIR}/qc/{{s}}.metrics.tsv", s=sorted(SAMPLES)),
+            samples=f"{OUTDIR}/cohort/samples.resolved"
+    output: table=f"{OUTDIR}/qc/sample_qc.tsv",
+            keep=f"{OUTDIR}/qc/samples_pass.txt",
+            drop=f"{OUTDIR}/qc/samples_fail.txt"
+    resources: mem_mb=4000, runtime=30
+    conda: E["python"]
+    shell:
+        r"""
+        python3 {SCRIPTS}/sample_qc_gate.py \
+            --metrics {input.metrics} --samples {input.samples} \
+            --out-table {output.table} --out-pass {output.keep} --out-fail {output.drop} \
+            --min-snps {QC_MIN_SNPS} --min-median-dp {QC_MIN_DP} \
+            --het-lo {QC_HET[0]} --het-hi {QC_HET[1]} \
+            --min-ts-tv {QC_TSTV} --max-fail-frac {QC_MAXFAIL}
         """
 
 rule cohort_merge:
-    input:  expand(f"{OUTDIR}/normalized/{{s}}.norm.snps.vcf.gz", s=sorted(SAMPLES))
+    input:  vcfs=expand(f"{OUTDIR}/normalized/{{s}}.norm.snps.vcf.gz", s=sorted(SAMPLES)),
+            keep=f"{OUTDIR}/qc/samples_pass.txt"
     output: vcf=f"{OUTDIR}/cohort/merge.vcf.gz",
             tbi=f"{OUTDIR}/cohort/merge.vcf.gz.tbi",
             mlist=f"{OUTDIR}/cohort/merge.list"
@@ -143,8 +201,17 @@ rule cohort_merge:
     conda: E["bcftools"]
     shell:
         r"""
+        # Only QC-passing samples enter the cohort (rule sample_qc). Every ingested VCF is
+        # still an input so the DAG is static and the per-sample QC metrics always exist;
+        # the merge list itself is built from the pass list.
         : > {output.mlist}
-        for f in {input}; do echo "$f" >> {output.mlist}; done
+        while IFS=$'\t' read -r s _rest; do
+            [ -z "$s" ] && continue
+            f="{OUTDIR}/normalized/${{s}}.norm.snps.vcf.gz"
+            [ -s "$f" ] && echo "$f" >> {output.mlist}
+        done < {input.keep}
+        [ -s {output.mlist} ] || {{ echo "[ERROR] no QC-passing samples to merge; see {OUTDIR}/qc/sample_qc.tsv"; exit 1; }}
+        echo "[INFO] cohort merge: $(wc -l < {output.mlist}) of $(ls {OUTDIR}/normalized/*.norm.snps.vcf.gz 2>/dev/null | wc -l) ingested samples passed input QC"
         if [ "$(wc -l < {output.mlist})" -le 1 ]; then
             bcftools view --threads {threads} -Oz -o {output.vcf} "$(cat {output.mlist})"
         else
@@ -263,8 +330,17 @@ rule merge_intersect:
               --keep-allele-order --allow-no-sex --make-bed --out {OUTDIR}/merge/1kg_study_merge --threads {threads}
         cut -f2 {OUTDIR}/bed/study.varids.bim | sort -u > {OUTDIR}/merge/ids_study.txt
         cut -f2 {OUTDIR}/bed/ref.varids.bim   | sort -u > {OUTDIR}/merge/ids_ref.txt
-        comm -12 {OUTDIR}/merge/ids_study.txt {OUTDIR}/merge/ids_ref.txt > {OUTDIR}/merge/overlap_snps.txt
-        [ -s {OUTDIR}/merge/overlap_snps.txt ] || {{ echo "[ERROR] study/1KG SNP intersection empty"; exit 1; }}
+        comm -12 {OUTDIR}/merge/ids_study.txt {OUTDIR}/merge/ids_ref.txt > {OUTDIR}/merge/overlap_snps.raw.txt
+        [ -s {OUTDIR}/merge/overlap_snps.raw.txt ] || {{ echo "[ERROR] study/1KG SNP intersection empty"; exit 1; }}
+        # Strand-ambiguous (A/T, C/G) SNP exclusion - params.exclude_ambiguous in config.yaml.
+        if [ "{EXCL_AMBIG}" = "True" ]; then
+            bash {SCRIPTS}/drop_ambiguous.sh {OUTDIR}/merge/overlap_snps.raw.txt \
+                 {OUTDIR}/merge/overlap_snps.txt {OUTDIR}/merge/overlap_snps.ambiguous_dropped.txt
+        else
+            cp {OUTDIR}/merge/overlap_snps.raw.txt {OUTDIR}/merge/overlap_snps.txt
+            : > {OUTDIR}/merge/overlap_snps.ambiguous_dropped.txt
+            echo "[ambig] exclude_ambiguous=false - palindromic SNPs retained"
+        fi
         plink --bfile {OUTDIR}/merge/1kg_study_merge --extract {OUTDIR}/merge/overlap_snps.txt \
               --keep-allele-order --allow-no-sex --make-bed --out {OUTDIR}/merge/1kg_study_merge_qced --threads {threads}
         """

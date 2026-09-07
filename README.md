@@ -71,6 +71,29 @@ immediately with a message naming the anchor to set, so it can never silently us
 Analysis parameters (K, MAF, LD-pruning, superpopulations, etc.) are locked in the `params:` block
 of `config.yaml`; edit there.
 
+### Two settings worth checking before your first run
+
+These are the two ways a run silently produces nothing, so they are called out separately. Both are
+handled at ingest, in `workflow/scripts/ingest_one.sh`.
+
+**`reference.contig_style`** - the contig naming used by *your 1000G panel*: `"nochr"` (`1`, `2`, ...
+`22`, the default and what the 1000G releases use) or `"chr"` (`chr1`, `chr2`, ...). Your study VCFs
+do **not** have to match: ingest detects each study VCF's own naming from its first data record and
+converts it. Set this to whatever the panel uses. A study/panel contig mismatch produces an empty
+intersection with no error, which is the single most common way to get a run that "works" and
+returns nothing.
+
+**`params.ingest_filters`** - the `bcftools --apply-filters` list applied to each study VCF. The
+default `"PASS,."` keeps records marked `PASS` *and* records whose `FILTER` column is unset (`.`),
+which is what GATK HaplotypeCaller writes when no `VariantFiltration` / `CNNScoreVariants` step was
+run. A bare `"PASS"` yields **zero** variants for those inputs. Use `"PASS"` to require an explicit
+pass, or e.g. `"PASS,.,LowQual"` to be more permissive.
+
+Ingest also forces each single-sample VCF's internal sample name to the pipeline's sample ID, so the
+cohort merge, the QC table and the ADMIXTURE output rows all agree even when the caller wrote a
+run-level name (nf-core commonly writes e.g. `patient1_B30` rather than `B30`), and two inputs can
+never collide on a shared internal name.
+
 ## Reference data
 
 Provide and validate references once:
@@ -83,6 +106,31 @@ Provide and validate references once:
 
 The 1000G sample→population table (`resources/1K_pops.txt`) and the long-range-LD exclusion regions
 (`resources/high-LD-regions-hg38-GRCh38.txt`) are committed with the repo.
+
+## Try it on example data
+
+No access to a restricted cohort is needed to test SHAKIRA. `resources/get_example_data.sh`
+downloads six **public CCLE RNA-seq runs** (SRA study SRP186687) whose DNA-based ancestry is already
+published in `Validation/ccle_ancestry_master.csv`, so the correct answer is known in advance:
+
+```bash
+bash resources/get_example_data.sh --list          # show the six cell lines and expected ancestry
+bash resources/get_example_data.sh                 # ~1.5 GB, a few minutes
+bash resources/get_example_data.sh --full          # complete runs (~90 GB) if you want full depth
+```
+
+By default it uses HTTP range requests to pull only the first few hundred MB of each gzipped FASTQ
+and truncates to whole records, giving ~2M read pairs per sample. That is shallow compared with a
+full run but still yields tens of thousands of autosomal SNPs per sample - well above the
+`params.qc.min_snps` gate - so the ancestry calls come out correct.
+
+It writes `example_data/samplesheet.csv` (ready for nf-core/rnavar) and
+`example_data/expected_ancestry.csv`. Run the two pipeline stages, then compare:
+
+| sample | cell line | expected |
+|---|---|---|
+| Raji, P3HR1, PLCPRF5 | Burkitt lymphoma / hepatoma | >95% AFR |
+| MDAMB361, WM2664, VMCUB1 | breast / melanoma / bladder | >95% EUR |
 
 ## Upstream variant calling (produce the study VCFs)
 
@@ -112,8 +160,52 @@ bash run_snakemake.sh --unlock      # release a stale lock
 SMK_PROFILE=profiles/local bash run_snakemake.sh
 ```
 
+## Quality control
+
+**Sample-level input gate.** After ingest and *before* the cohort merge, every sample is scored on
+four metrics and samples that cannot support an ancestry call are excluded with a recorded reason.
+A library with too few callable SNPs, or with coverage too low for confident genotypes, would
+otherwise be carried all the way to ADMIXTURE and return an ancestry vector driven by a handful of
+sites. Thresholds live in `config.yaml` under `params.qc`:
+
+| key | default | what it catches |
+|---|---|---|
+| `min_snps` | 10000 | too few retained biallelic autosomal SNPs to place the sample |
+| `min_median_dp` | 0 (off) | median `FORMAT/DP`; **reported, not gated** for RNA-seq - see below |
+| `het_range` | `[0.05, 0.70]` | heterozygous fraction outside this = contamination (high) or clonal/LOH (low) |
+| `min_ts_tv` | 1.50 | Ti/Tv collapse toward 0.5 indicates noise rather than real germline SNVs |
+| `max_fail_frac` | 0.50 | aborts the run if most samples fail, which means an upstream problem |
+
+Outputs: `qc/sample_qc.tsv` (every sample, every metric, PASS/FAIL + reason), `qc/samples_pass.txt`,
+`qc/samples_fail.txt`. Set a threshold to `0` to disable that check.
+
+**Why `min_median_dp` is off by default.** `FORMAT/DP` at a called RNA-seq SNP tracks transcript
+abundance, not library quality: most called sites sit in moderately expressed transcripts, so the
+per-sample *median* over all called SNPs stays at 2-4 even for libraries that cover highly expressed
+genes very deeply. The distribution is strongly right-skewed and its median is the wrong summary of
+it. Across the 53 panNET RNA-seq libraries used to calibrate this gate, not one sample reached a
+median DP of 5, so any non-trivial floor fails every sample. The value is still computed and written
+to `qc/sample_qc.tsv` for inspection. **Raise it (e.g. `10`) for WES/WGS input**, where median depth
+genuinely is a quality measure. `het_range`'s upper bound is `0.70` rather than `0.60` for the same
+reason: low-depth heterozygote over-calling plus allele-specific expression push good RNA-seq
+libraries to ~0.6 (observed range across those 53 samples: 0.154-0.609).
+
+**Variant-level QC** is unchanged: study call rate (`params.max_missing`), per-superpopulation
+reference MAF (`params.ref_maf`), study coverage (`params.study_coverage`), long-range-LD exclusion,
+and LD pruning. Pooled MAF/HWE on the merged panel stay off by default because on a multi-ancestry
+panel they preferentially discard ancestry-informative markers.
+
+**Strand-ambiguous SNPs.** `params.exclude_ambiguous` (default `true`) drops palindromic A/T and C/G
+SNPs from the study/1000G intersection. SHAKIRA is not structurally exposed to strand error - study
+and reference genotypes are both called against GRCh38, variants are matched on exact
+`CHROM_POS_REF_ALT` IDs assigned before merging, and every PLINK step runs `--keep-allele-order`, so
+no strand or A1/A2 flip is ever attempted and a mismatched variant simply fails to intersect - but
+excluding these SNPs removes the whole class of risk at negligible cost. The dropped IDs are written
+to `merge/overlap_snps.ambiguous_dropped.txt`; set the flag to `false` to retain them.
+
 ## Outputs (under `work_root`/`outdir`, default `<work_root>/amr`)
 
+- `qc/sample_qc.tsv` — per-sample input QC metrics with PASS/FAIL and the reason for each exclusion
 - `admixture/prunedData.<K>.Q` — supervised ancestry proportions (rows aligned to `prunedData.fam`)
 - `analysis/ancestry_study_proportions.csv` — per-sample AFR/EUR/AMR(/…) proportions + dominant call
 - `analysis/concordance_summary.txt`, `ancestry_concordance.csv` — agreement vs the CCLE reference
@@ -150,7 +242,9 @@ envs/                     per-rule conda envs
 profiles/  slurm/  local/    execution profiles (site config lives here)
 refs/      prep_refs.sh  capture_versions.sh
 resources/                committed reference tables (1K_pops, high-LD regions)
+           get_example_data.sh   downloads the public CCLE example dataset
 workflow/  Snakefile  scripts/    the workflow + its helper scripts
+           scripts/sample_qc_one.sh  sample_qc_gate.py  drop_ambiguous.sh
 Validation/               nf-core rnavar/sarek runners + resource config + sample-sheet builder
 cheaha/  K3/              legacy scripts, kept for provenance only (see their README.md)
 ```
